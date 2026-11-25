@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SyncClipboard Xposed</string>
+    <string name="module_description">后台无感同步 SyncClipboard v3.3.4、多节点智能选路与系统级验证码捕获模块 (API 102)</string>
+    <string name="tile_sync_label">剪贴板同步</string>
+    <string name="tile_sync_on">自动同步中</string>
+    <string name="tile_sync_off">已暂停</string>
+    <string name="share_title">发送到 SyncClipboard</string>
+</resources>

@@ -1,0 +1,14 @@
+local.properties
+.gradle/
+.gradle-cache/
+.kotlin/
+build/
+app/build/
+dist/
+work/
+*.apk
+*.aab
+*.idsig
+*.p12
+*.jks
+*.keystore

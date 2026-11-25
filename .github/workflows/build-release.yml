@@ -1,0 +1,421 @@
+name: Build and Release APK
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v1.0.0"
+        required: false
+        default: ""
+      publish_release:
+        description: "Publish GitHub Release"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: syncclipboard-xposed-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v4
+      - name: Install Android 37 SDK and Build-Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.7.0"
+      - name: Run unit tests, lint, and debug build
+        run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --stacktrace --no-daemon
+      - name: Verify API 102 module metadata and manifest in debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEBUG_APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$DEBUG_APK"
+          python3 - "$DEBUG_APK" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as zf:
+              names = set(zf.namelist())
+              assert "classes.dex" in names, "classes.dex missing"
+              assert "assets/xposed_init" not in names, "legacy assets/xposed_init must be absent"
+
+              prop_raw = zf.read("META-INF/xposed/module.prop")
+              assert b"\r" not in prop_raw, "META-INF/xposed/module.prop contains CR"
+              prop_text = prop_raw.decode("utf-8")
+              assert "minApiVersion=102" in prop_text, "minApiVersion=102 missing"
+              assert "targetApiVersion=102" in prop_text, "targetApiVersion=102 missing"
+              assert "staticScope=true" in prop_text, "staticScope=true missing"
+              assert "exceptionMode=protective" in prop_text, "exceptionMode=protective missing"
+              assert "autoHotReload=true" in prop_text, "autoHotReload=true missing"
+
+              init_raw = zf.read("META-INF/xposed/java_init.list")
+              assert b"\r" not in init_raw, "META-INF/xposed/java_init.list contains CR"
+              assert init_raw.decode("utf-8").strip() == "com.scluzlep.syncclipboard.xposed.SyncClipboardModule"
+
+              scope_raw = zf.read("META-INF/xposed/scope.list")
+              assert b"\r" not in scope_raw, "META-INF/xposed/scope.list contains CR"
+              scopes = [line.strip() for line in scope_raw.decode("utf-8").splitlines() if line.strip()]
+              assert set(scopes) == {"com.android.systemui", "system"}, f"unexpected scope.list: {scopes}"
+          print("Verified debug APK libxposed API 102 metadata")
+          PY
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          MANIFEST_TREE="$("$BUILD_TOOLS/aapt2" dump xmltree "$DEBUG_APK" --file AndroidManifest.xml)"
+          echo "$MANIFEST_TREE" | grep -q "android.intent.category.LAUNCHER"
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.ACTION_OPEN_SETTINGS"
+          echo "$MANIFEST_TREE" | grep -q "io.github.libxposed.service.XposedProvider"
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.service.SyncClipboardEngineService"
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.ui.ShareActivity"
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.tile.SyncToggleTileService"
+          echo "$MANIFEST_TREE" | grep -q "android.permission.ACCESS_LOCAL_NETWORK"
+          if echo "$MANIFEST_TREE" | grep -q "android.permission.RECEIVE_SMS"; then
+            echo "::error::RECEIVE_SMS permission must not be present"
+            exit 1
+          fi
+          if echo "$MANIFEST_TREE" | grep -q "xposedminversion"; then
+            echo "::error::Legacy xposedminversion metadata present"
+            exit 1
+          fi
+
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.ui.LauncherAlias"
+          BADGING_OUT="$("$BUILD_TOOLS/aapt2" dump badging "$DEBUG_APK")"
+          echo "$BADGING_OUT" | grep -q "package: name='com.scluzlep.syncclipboard'"
+
+          python3 - "$MANIFEST_TREE" <<'PY'
+          import re, sys
+          lines = sys.argv[1].splitlines()
+          fp = None
+          for idx, line in enumerate(lines):
+              if re.match(r"^\s*E:\s+provider\b", line):
+                  indent = len(line) - len(line.lstrip())
+                  block = [line]
+                  for nxt in lines[idx + 1:]:
+                      if nxt.strip() and (len(nxt) - len(nxt.lstrip())) <= indent:
+                          break
+                      block.append(nxt)
+                  block_text = "\n".join(block)
+                  if "androidx.core.content.FileProvider" in block_text:
+                      fp = block_text
+                      break
+          assert fp is not None, "FileProvider missing from AndroidManifest.xml"
+          assert ".fileprovider" in fp, "FileProvider missing .fileprovider authority"
+          assert re.search(r"android:exported(?:\(0x[0-9a-f]+\))?=(?:false|\(type 0x12\)0x0)\b", fp), f"FileProvider must have exported=false:\n{fp}"
+          PY
+      - name: Upload PR debug APK artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncclipboard-xposed-debug-pr-${{ github.run_number }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 3
+
+  build-and-release:
+    needs: check
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+      SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+      SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+      SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v4
+      - name: Install Android 37 SDK and Build-Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.7.0"
+
+      - name: Resolve version tag and Gradle version overrides
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish_release }}
+        run: |
+          set -euo pipefail
+          DEFAULT_CODE="$(sed -n 's/.*SYNCCLIPBOARD_VERSION_CODE.*?: *\([0-9][0-9]*\).*/\1/p' app/build.gradle.kts | head -n 1)"
+          DEFAULT_VER="$(sed -n 's/.*SYNCCLIPBOARD_VERSION_NAME.*?: *"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+          DEFAULT_CODE="${DEFAULT_CODE:-1000001}"
+          DEFAULT_VER="${DEFAULT_VER:-1.0.0}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          derive_version_env() {
+            local raw_tag="$1"
+            if [[ ! "$raw_tag" =~ ^v([0-9]+)\.([0-9]+)(\.([0-9]+))?([+-].*)?$ ]]; then
+              echo "::error::Tag must match vMAJOR.MINOR or vMAJOR.MINOR.PATCH, got: $raw_tag"
+              exit 1
+            fi
+            local major=$((10#${BASH_REMATCH[1]}))
+            local minor=$((10#${BASH_REMATCH[2]}))
+            local patch=$((10#${BASH_REMATCH[4]:-0}))
+            if ((minor >= 1000 || patch >= 1000)); then
+              echo "::error::Minor and patch version components must stay below 1000"
+              exit 1
+            fi
+            local vcode=$((major * 1000000 + minor * 1000 + patch + 1))
+            if ((vcode > 2100000000)); then
+              echo "::error::Android versionCode limit exceeded"
+              exit 1
+            fi
+            echo "SYNCCLIPBOARD_VERSION_NAME=${raw_tag#v}" >> "$GITHUB_ENV"
+            echo "SYNCCLIPBOARD_VERSION_CODE=${vcode}" >> "$GITHUB_ENV"
+          }
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            DO_RELEASE="true"
+            derive_version_env "$TAG"
+          elif [[ -n "${INPUT_TAG}" ]]; then
+            TAG="${INPUT_TAG}"
+            DO_RELEASE="${INPUT_PUBLISH}"
+            if [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)(\.([0-9]+))?([+-].*)?$ ]]; then
+              derive_version_env "$TAG"
+            fi
+          else
+            TAG="v${DEFAULT_VER}-${SHORT_SHA}"
+            DO_RELEASE="${INPUT_PUBLISH}"
+          fi
+
+          echo "version_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "do_release=${DO_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version_tag=${TAG} do_release=${DO_RELEASE}"
+
+      - name: Validate SigHelper secrets before release
+        if: steps.meta.outputs.do_release == 'true'
+        shell: bash
+        run: |
+          test -n "$SIGNING_KEYSTORE_BASE64" || { echo "::error::Missing secret SIGNING_KEYSTORE_BASE64. Sync via SigHelper android-sig."; exit 1; }
+          test -n "$SIGNING_PASSWORD" || { echo "::error::Missing secret SIGNING_PASSWORD. Sync via SigHelper android-sig."; exit 1; }
+
+      - name: Lint and build unsigned release APK
+        run: gradle :app:lintVitalRelease :app:assembleRelease --stacktrace --no-daemon
+
+      - name: Zipalign, sign with SigHelper PKCS#12 secrets, and verify APK
+        id: sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.version_tag }}"
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          test -n "$BUILD_TOOLS"
+          mkdir -p dist work
+
+          RAW_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          if [[ ! -f "$RAW_APK" ]]; then
+            RAW_APK="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -n 1)"
+          fi
+          test -s "$RAW_APK"
+
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$RAW_APK" work/aligned.apk
+
+          if [[ -n "${SIGNING_KEYSTORE_BASE64:-}" && -n "${SIGNING_PASSWORD:-}" ]]; then
+            umask 077
+            printf '%s' "$SIGNING_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.p12"
+            test -s "$RUNNER_TEMP/release.p12"
+
+            ALIAS_ARGS=()
+            if [[ -n "${SIGNING_KEY_ALIAS:-}" ]]; then
+              ALIAS_ARGS+=(--ks-key-alias "$SIGNING_KEY_ALIAS")
+            fi
+            KEY_PASS="${SIGNING_KEY_PASSWORD:-$SIGNING_PASSWORD}"
+            export KEY_PASS
+
+            APK_NAME="syncclipboard-xposed-${TAG}.apk"
+            OUT_APK="dist/${APK_NAME}"
+            "$BUILD_TOOLS/apksigner" sign \
+              --ks "$RUNNER_TEMP/release.p12" \
+              --ks-type PKCS12 \
+              "${ALIAS_ARGS[@]}" \
+              --ks-pass env:SIGNING_PASSWORD \
+              --key-pass env:KEY_PASS \
+              --out "$OUT_APK" \
+              work/aligned.apk
+
+            CERT_LOG="$("$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$OUT_APK")"
+            echo "$CERT_LOG"
+            CERT_SHA="$(printf '%s\n' "$CERT_LOG" | sed -n 's/.*certificate SHA-256 digest: //p' | head -n 1 | tr '[:lower:]' '[:upper:]')"
+
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "cert_sha256=$CERT_SHA" >> "$GITHUB_OUTPUT"
+          else
+            APK_NAME="syncclipboard-xposed-${TAG}-unsigned.apk"
+            OUT_APK="dist/${APK_NAME}"
+            cp work/aligned.apk "$OUT_APK"
+            echo "::notice::SigHelper secrets not set; produced unsigned APK artifact only."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "cert_sha256=unsigned" >> "$GITHUB_OUTPUT"
+          fi
+
+          MANIFEST_TREE="$("$BUILD_TOOLS/aapt2" dump xmltree "$OUT_APK" --file AndroidManifest.xml)"
+          echo "$MANIFEST_TREE" | grep -q "android.intent.category.LAUNCHER"
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.ACTION_OPEN_SETTINGS"
+          echo "$MANIFEST_TREE" | grep -q "io.github.libxposed.service.XposedProvider"
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.service.SyncClipboardEngineService"
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.ui.ShareActivity"
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.tile.SyncToggleTileService"
+          if echo "$MANIFEST_TREE" | grep -q "xposedminversion"; then
+            echo "::error::Legacy xposedminversion metadata present in release APK"
+            exit 1
+          fi
+
+          echo "$MANIFEST_TREE" | grep -q "com.scluzlep.syncclipboard.ui.LauncherAlias"
+          BADGING_OUT="$("$BUILD_TOOLS/aapt2" dump badging "$OUT_APK")"
+          echo "$BADGING_OUT" | grep -q "package: name='com.scluzlep.syncclipboard'"
+
+          python3 - "$MANIFEST_TREE" <<'PY'
+          import re, sys
+          lines = sys.argv[1].splitlines()
+          fp = None
+          for idx, line in enumerate(lines):
+              if re.match(r"^\s*E:\s+provider\b", line):
+                  indent = len(line) - len(line.lstrip())
+                  block = [line]
+                  for nxt in lines[idx + 1:]:
+                      if nxt.strip() and (len(nxt) - len(nxt.lstrip())) <= indent:
+                          break
+                      block.append(nxt)
+                  block_text = "\n".join(block)
+                  if "androidx.core.content.FileProvider" in block_text:
+                      fp = block_text
+                      break
+          assert fp is not None, "FileProvider missing from release AndroidManifest.xml"
+          assert ".fileprovider" in fp, "FileProvider missing .fileprovider authority in release APK"
+          assert re.search(r"android:exported(?:\(0x[0-9a-f]+\))?=(?:false|\(type 0x12\)0x0)\b", fp), f"Release FileProvider must have exported=false:\n{fp}"
+          PY
+
+          python3 - "$OUT_APK" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as zf:
+              names = set(zf.namelist())
+              assert "classes.dex" in names
+              assert "assets/xposed_init" not in names
+
+              prop_raw = zf.read("META-INF/xposed/module.prop")
+              assert b"\r" not in prop_raw
+              prop = prop_raw.decode("utf-8")
+              assert "minApiVersion=102" in prop
+              assert "targetApiVersion=102" in prop
+              assert "staticScope=true" in prop
+              assert "exceptionMode=protective" in prop
+              assert "autoHotReload=true" in prop
+
+              init_raw = zf.read("META-INF/xposed/java_init.list")
+              assert b"\r" not in init_raw
+              assert init_raw.decode("utf-8").strip() == "com.scluzlep.syncclipboard.xposed.SyncClipboardModule"
+
+              scope_raw = zf.read("META-INF/xposed/scope.list")
+              assert b"\r" not in scope_raw
+              scopes = [line.strip() for line in scope_raw.decode("utf-8").splitlines() if line.strip()]
+              assert set(scopes) == {"com.android.systemui", "system"}
+          print("Verified release APK libxposed API 102 metadata")
+          PY
+
+          echo "apk_file=$OUT_APK" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Wipe temporary PKCS#12 keystore
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/release.p12"
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f dist/*.idsig
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload CI build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncclipboard-xposed-${{ steps.meta.outputs.version_tag }}
+          path: dist/*
+          retention-days: 14
+
+      - name: Prepare GitHub Release notes
+        if: steps.meta.outputs.do_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.version_tag }}"
+          cat > work/release_notes.md <<EOF
+          ## SyncClipboard Xposed ${TAG}
+
+          - Xposed API: libxposed API 102
+          - Scope: \`com.android.systemui\`, \`system\`
+          - Protocol: SyncClipboard v3.3.4 Official + SignalR + WebDAV
+          - APK: \`${{ steps.sign.outputs.apk_name }}\`
+          - Signer SHA-256: \`${{ steps.sign.outputs.cert_sha256 }}\`
+
+          ### Checksums
+          \`\`\`text
+          $(cat dist/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.do_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.version_tag }}"
+          APK_FILE="${{ steps.sign.outputs.apk_file }}"
+          APK_NAME="${{ steps.sign.outputs.apk_name }}"
+          SUM_PATH="dist/SHA256SUMS.txt"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "${APK_FILE}#${APK_NAME}" \
+              "${SUM_PATH}#SHA256SUMS.txt" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" \
+              --prerelease=false \
+              --title "SyncClipboard Xposed ${TAG}" \
+              --notes-file work/release_notes.md \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" \
+              "${APK_FILE}#${APK_NAME}" \
+              "${SUM_PATH}#SHA256SUMS.txt" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "SyncClipboard Xposed ${TAG}" \
+              --notes-file work/release_notes.md
+          fi

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Clipboard body -->
+    <path
+        android:fillColor="#26000000"
+        android:pathData="M34,30H74C77.3,30 80,32.7 80,36V78C80,81.3 77.3,84 74,84H34C30.7,84 28,81.3 28,78V36C28,32.7 30.7,30 34,30Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M34,27H74C77.3,27 80,29.7 80,33V75C80,78.3 77.3,81 74,81H34C30.7,81 28,78.3 28,75V33C28,29.7 30.7,27 34,27Z" />
+    <!-- Top clip -->
+    <path
+        android:fillColor="#FF007DFF"
+        android:pathData="M45,22H63C64.7,22 66,23.3 66,25V30C66,31.7 64.7,33 63,33H45C43.3,33 42,31.7 42,30V25C42,23.3 43.3,22 45,22Z" />
+    <!-- Sync arrows inside clipboard -->
+    <path
+        android:fillColor="#FF007DFF"
+        android:pathData="M54,43L63,52H57V57H51V52H45L54,43ZM54,69L45,60H51V55H57V60H63L54,69Z" />
+</vector>
